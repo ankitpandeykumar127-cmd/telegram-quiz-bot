@@ -1,23 +1,39 @@
 require("dotenv").config();
 const fs = require("fs");
+const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 
+const app = express();
+app.use(express.json());
+
+// ================= ENV =================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = process.env.ADMIN_IDS.split(",").map(Number);
 const GROUP_ID = Number(process.env.QUIZ_GROUP_ID);
 const CHANNEL_ID = Number(process.env.QUIZ_CHANNEL_ID);
 const GROUP_LINK = process.env.GROUP_INVITE_LINK;
+const APP_URL = process.env.APP_URL;
 
-if (!BOT_TOKEN || !GROUP_ID || !CHANNEL_ID || !GROUP_LINK) {
+if (!BOT_TOKEN || !GROUP_ID || !CHANNEL_ID || !GROUP_LINK || !APP_URL) {
   console.error("❌ Missing env values");
   process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: { interval: 300, autoStart: true }
+// ================= BOT =================
+const bot = new TelegramBot(BOT_TOKEN);
+bot.setWebHook(`${APP_URL}/bot${BOT_TOKEN}`);
+
+app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
 });
 
-console.log("🤖 Quiz Bot Running");
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log("🚀 Webhook server running on", PORT)
+);
+
+console.log("🤖 Quiz Bot Running (Webhook Mode)");
 
 // ================= FILE HELPERS =================
 const readJSON = (f, d) => {
@@ -41,7 +57,7 @@ let quiz = {
   pollMap: {},
   scores: {},
   users: {},
-  answered: {}, // ✅ FIX
+  answered: {},
   active: false
 };
 
@@ -86,9 +102,7 @@ bot.on("message", msg => {
   if (!msg.text || msg.text.startsWith("/")) return;
 
   const lines = msg.text.split("\n");
-  let currentDate = null;
-  let currentSession = null;
-  let currentTime = null;
+  let currentDate = null, currentSession = null, currentTime = null;
   let buffer = [];
 
   const flushSession = () => {
@@ -97,8 +111,7 @@ bot.on("message", msg => {
     const key = `${currentDate}_${currentSession}`;
     sessions[key] = [];
 
-    const blocks = buffer.join("\n").split(/\n\s*\n/);
-    blocks.forEach(b => {
+    buffer.join("\n").split(/\n\s*\n/).forEach(b => {
       let q="", o=[], a="";
       b.split("\n").forEach(l=>{
         l=l.trim();
@@ -131,53 +144,37 @@ bot.on("message", msg => {
     line=line.trim();
     if(line.startsWith("DATE:")){
       flushSession();
-      currentDate = line.replace("DATE:","").trim().split("-").reverse().join("-");
-    }
-    else if(line.startsWith("SESSION:")){
+      currentDate=line.replace("DATE:","").trim().split("-").reverse().join("-");
+    } else if(line.startsWith("SESSION:")){
       flushSession();
-      currentSession = line.replace("SESSION:","").trim();
-    }
-    else if(line.startsWith("TIME:")){
-      currentTime = line.replace("TIME:","").trim();
-    }
-    else buffer.push(line);
+      currentSession=line.replace("SESSION:","").trim();
+    } else if(line.startsWith("TIME:")){
+      currentTime=line.replace("TIME:","").trim();
+    } else buffer.push(line);
   });
 
   flushSession();
   writeJSON("sessions.json", sessions);
   writeJSON("schedule.json", schedules);
-  bot.sendMessage(msg.chat.id,"✅ Sessions & schedules saved");
-});
 
-// ================= DELETE =================
-bot.onText(/\/deleteschedule (.+)/, (msg, match) => {
-  if (!isAdmin(msg.from.id)) return;
-  const name = match[1].trim();
-  schedules = schedules.filter(s => s.session !== name);
-  delete sessions[name];
-  writeJSON("schedule.json", schedules);
-  writeJSON("sessions.json", sessions);
-  bot.sendMessage(msg.chat.id, `🗑️ Deleted: ${name}`);
+  bot.sendMessage(msg.chat.id,"✅ Sessions & schedules saved");
 });
 
 // ================= STATUS =================
 bot.onText(/\/status/, msg => {
   if (!isAdmin(msg.from.id)) return;
-
   let text = `📊 *Bot Status*\n\n📘 Sessions:\n`;
   Object.keys(sessions).forEach((k,i)=>{
     text+=`${i+1}. ${k} (${sessions[k].length}Q)\n`;
   });
-
-  text += `\n⏰ Schedules:\n`;
+  text+=`\n⏰ Schedules:\n`;
   schedules.forEach((s,i)=>{
     text+=`${i+1}. ${s.session} — ${s.date} ${s.time}\n`;
   });
-
   bot.sendMessage(msg.chat.id,text,{parse_mode:"Markdown"});
 });
 
-// ================= SCHEDULER (FIXED) =================
+// ================= SCHEDULER (MISS-PROOF) =================
 setInterval(()=>{
   const now = new Date();
 
@@ -187,7 +184,6 @@ setInterval(()=>{
     const [h,m]=s.time.split(":").map(Number);
     const t=new Date(s.date);
     t.setHours(h,m,0,0);
-
     const diff = t - now;
 
     if (!s.discussion && diff <= 30*60*1000 && diff > 0) {
@@ -210,8 +206,8 @@ setInterval(()=>{
 });
     }
 
-    // ✅ GRACE WINDOW (fix missed session)
-    if (diff <= 60*1000 && diff >= -60*1000) {
+    // ✅ 2 minute grace window
+    if (diff <= 60*1000 && diff >= -120*1000) {
       s.started = true;
       startQuiz(s.session);
     }
@@ -222,13 +218,13 @@ setInterval(()=>{
 
 // ================= QUIZ =================
 function startQuiz(session){
-  quiz = {
+  quiz={
     session,
     index:0,
     pollMap:{},
     scores:{},
     users:{},
-    answered:{}, // ✅ FIX
+    answered:{},
     active:true
   };
 
@@ -242,50 +238,45 @@ function sendNext(){
   const q=sessions[quiz.session]?.[quiz.index];
   if(!q) return setTimeout(showLeaderboard,3000);
 
-  const currentIndex = quiz.index;
+  const idx=quiz.index;
 
   bot.sendPoll(GROUP_ID,
-    `Q${currentIndex+1}. ${q.question}`,
+    `Q${idx+1}. ${q.question}`,
     q.options,{
       type:"quiz",
       correct_option_id:q.correct,
       is_anonymous:false,
       open_period:20
     }).then(p=>{
-      quiz.pollMap[p.poll.id] = {
-        correct: q.correct,
-        index: currentIndex
-      };
+      quiz.pollMap[p.poll.id]={ correct:q.correct, index:idx };
       quiz.index++;
       setTimeout(sendNext,25000);
     });
 }
 
-// ================= SCORE FIX =================
-bot.on("poll_answer", a => {
-  if (!quiz.active) return;
-  const map = quiz.pollMap[a.poll_id];
-  if (!map) return;
+// ================= SCORE (BULLETPROOF) =================
+bot.on("poll_answer", a=>{
+  if(!quiz.active) return;
+  const map=quiz.pollMap[a.poll_id];
+  if(!map) return;
 
-  const userId = a.user.id;
-  quiz.users[userId] = a.user.first_name || "User";
+  const uid=a.user.id;
+  quiz.users[uid]=a.user.first_name||"User";
+  quiz.answered[uid] ??= new Set();
 
-  quiz.answered[userId] ??= new Set();
-  if (quiz.answered[userId].has(map.index)) return;
+  if(quiz.answered[uid].has(map.index)) return;
+  quiz.answered[uid].add(map.index);
 
-  quiz.answered[userId].add(map.index);
-
-  if (a.option_ids[0] === map.correct) {
-    quiz.scores[userId] = (quiz.scores[userId] || 0) + 1;
+  if(a.option_ids[0]===map.correct){
+    quiz.scores[uid]=(quiz.scores[uid]||0)+1;
   }
 });
 
 function showLeaderboard(){
   setGroupPermission(true);
+  const total=sessions[quiz.session]?.length||0;
 
-  const total = sessions[quiz.session]?.length || 0;
   let text="🏆 *Leaderboard*\n\n";
-
   Object.keys(quiz.users).map(id=>({
     name:quiz.users[id],
     score:quiz.scores[id]||0
@@ -299,7 +290,7 @@ function showLeaderboard(){
   bot.sendMessage(GROUP_ID,"💬 Discussion opened (15 min)");
 
   delete sessions[quiz.session];
-  schedules = schedules.filter(s=>s.session!==quiz.session);
+  schedules=schedules.filter(s=>s.session!==quiz.session);
   writeJSON("sessions.json",sessions);
   writeJSON("schedule.json",schedules);
 
@@ -308,3 +299,7 @@ function showLeaderboard(){
     bot.sendMessage(GROUP_ID,"🔒 Discussion closed");
   },15*60*1000);
 }
+
+// ================= SAFETY =================
+process.on("unhandledRejection", e => console.error(e));
+process.on("uncaughtException", e => console.error(e));
