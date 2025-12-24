@@ -17,10 +17,6 @@ const bot = new TelegramBot(BOT_TOKEN, {
   polling: { interval: 300, autoStart: true }
 });
 
-bot.on("polling_error", err => {
-  console.log("Polling error:", err.message);
-});
-
 console.log("🤖 Quiz Bot Running");
 
 // ================= FILE HELPERS =================
@@ -44,8 +40,8 @@ let quiz = {
   index: 0,
   pollMap: {},
   scores: {},
-  attempts: {},
   users: {},
+  answered: {}, // ✅ FIX
   active: false
 };
 
@@ -74,18 +70,14 @@ bot.onText(/\/start/, msg => {
 // ================= ADMIN =================
 bot.onText(/\/admin/, msg => {
   if (!isAdmin(msg.from.id)) return;
-
-  bot.sendMessage(
-    msg.chat.id,
+  bot.sendMessage(msg.chat.id,
 `🛠 Admin Panel
 
 /status
 /deleteschedule SESSION_NAME
 
-📥 Send quiz data in ONE message`
-  );
+📥 Send quiz data in ONE message`);
 });
-
 
 // ================= SMART PARSER =================
 bot.on("message", msg => {
@@ -137,7 +129,6 @@ bot.on("message", msg => {
 
   lines.forEach(line=>{
     line=line.trim();
-
     if(line.startsWith("DATE:")){
       flushSession();
       currentDate = line.replace("DATE:","").trim().split("-").reverse().join("-");
@@ -155,31 +146,18 @@ bot.on("message", msg => {
   flushSession();
   writeJSON("sessions.json", sessions);
   writeJSON("schedule.json", schedules);
-
   bot.sendMessage(msg.chat.id,"✅ Sessions & schedules saved");
 });
 
 // ================= DELETE =================
 bot.onText(/\/deleteschedule (.+)/, (msg, match) => {
   if (!isAdmin(msg.from.id)) return;
-
   const name = match[1].trim();
   schedules = schedules.filter(s => s.session !== name);
   delete sessions[name];
-
   writeJSON("schedule.json", schedules);
   writeJSON("sessions.json", sessions);
-
   bot.sendMessage(msg.chat.id, `🗑️ Deleted: ${name}`);
-});
-
-// ================= STOP =================
-bot.onText(/\/stop/, msg => {
-  if (!isAdmin(msg.from.id) || !quiz.active) return;
-  quiz.active = false;
-  setGroupPermission(true);
-  bot.sendMessage(GROUP_ID,"🛑 Quiz stopped by owner");
-  showLeaderboard();
 });
 
 // ================= STATUS =================
@@ -199,43 +177,42 @@ bot.onText(/\/status/, msg => {
   bot.sendMessage(msg.chat.id,text,{parse_mode:"Markdown"});
 });
 
-// ================= SCHEDULER =================
+// ================= SCHEDULER (FIXED) =================
 setInterval(()=>{
   const now = new Date();
 
   schedules.forEach(s=>{
+    if (s.started) return;
+
     const [h,m]=s.time.split(":").map(Number);
     const t=new Date(s.date);
     t.setHours(h,m,0,0);
-    const diff=t-now;
 
-    // 30 min before → discussion ON
-    if(!s.discussion && diff<=30*60*1000 && diff>0){
-      s.discussion=true;
+    const diff = t - now;
+
+    if (!s.discussion && diff <= 30*60*1000 && diff > 0) {
+      s.discussion = true;
       setGroupPermission(true);
       bot.sendMessage(GROUP_ID,"💬 Discussion opened (30 min before quiz)");
     }
 
-    // 5 min notice → channel + button
-    if(!s.notice && diff<=5*60*1000 && diff>0){
-      s.notice=true;
-      bot.sendMessage(
-        CHANNEL_ID,
+    if (!s.notice && diff <= 5*60*1000 && diff > 0) {
+      s.notice = true;
+      bot.sendMessage(CHANNEL_ID,
 `🚨 *Quiz Alert*
 📘 ${s.session}
 ⏳ Starts in 5 minutes`,
 {
   parse_mode:"Markdown",
-  reply_markup:{
-    inline_keyboard:[
-      [{ text:"🚀 Join Quiz Group", url: GROUP_LINK }]
-    ]
-  }
+  reply_markup:{ inline_keyboard:[[{
+    text:"🚀 Join Quiz Group", url: GROUP_LINK
+  }]] }
 });
     }
 
-    if(!s.started && diff<=0){
-      s.started=true;
+    // ✅ GRACE WINDOW (fix missed session)
+    if (diff <= 60*1000 && diff >= -60*1000) {
+      s.started = true;
       startQuiz(s.session);
     }
   });
@@ -245,9 +222,14 @@ setInterval(()=>{
 
 // ================= QUIZ =================
 function startQuiz(session){
-  quiz={
-    session,index:0,pollMap:{},
-    scores:{},attempts:{},users:{},active:true
+  quiz = {
+    session,
+    index:0,
+    pollMap:{},
+    scores:{},
+    users:{},
+    answered:{}, // ✅ FIX
+    active:true
   };
 
   setGroupPermission(false);
@@ -260,40 +242,55 @@ function sendNext(){
   const q=sessions[quiz.session]?.[quiz.index];
   if(!q) return setTimeout(showLeaderboard,3000);
 
+  const currentIndex = quiz.index;
+
   bot.sendPoll(GROUP_ID,
-    `Q${quiz.index+1}. ${q.question}`,
+    `Q${currentIndex+1}. ${q.question}`,
     q.options,{
       type:"quiz",
       correct_option_id:q.correct,
       is_anonymous:false,
       open_period:20
     }).then(p=>{
-      quiz.pollMap[p.poll.id]=q.correct;
+      quiz.pollMap[p.poll.id] = {
+        correct: q.correct,
+        index: currentIndex
+      };
       quiz.index++;
       setTimeout(sendNext,25000);
     });
 }
 
-bot.on("poll_answer",a=>{
-  if(!quiz.active||!(a.poll_id in quiz.pollMap)) return;
-  const u=a.user;
-  quiz.users[u.id]=u.first_name||"User";
-  quiz.attempts[u.id]=(quiz.attempts[u.id]||0)+1;
-  if(a.option_ids[0]===quiz.pollMap[a.poll_id])
-    quiz.scores[u.id]=(quiz.scores[u.id]||0)+1;
+// ================= SCORE FIX =================
+bot.on("poll_answer", a => {
+  if (!quiz.active) return;
+  const map = quiz.pollMap[a.poll_id];
+  if (!map) return;
+
+  const userId = a.user.id;
+  quiz.users[userId] = a.user.first_name || "User";
+
+  quiz.answered[userId] ??= new Set();
+  if (quiz.answered[userId].has(map.index)) return;
+
+  quiz.answered[userId].add(map.index);
+
+  if (a.option_ids[0] === map.correct) {
+    quiz.scores[userId] = (quiz.scores[userId] || 0) + 1;
+  }
 });
 
 function showLeaderboard(){
   setGroupPermission(true);
 
-  const total=sessions[quiz.session].length;
-  const users=Object.keys(quiz.attempts);
-
+  const total = sessions[quiz.session]?.length || 0;
   let text="🏆 *Leaderboard*\n\n";
-  users.map(id=>({
+
+  Object.keys(quiz.users).map(id=>({
     name:quiz.users[id],
     score:quiz.scores[id]||0
-  })).sort((a,b)=>b.score-a.score)
+  }))
+  .sort((a,b)=>b.score-a.score)
   .forEach((u,i)=>{
     text+=`${i+1}. *${u.name}* — ${u.score}/${total}\n`;
   });
@@ -302,7 +299,7 @@ function showLeaderboard(){
   bot.sendMessage(GROUP_ID,"💬 Discussion opened (15 min)");
 
   delete sessions[quiz.session];
-  schedules=schedules.filter(s=>s.session!==quiz.session);
+  schedules = schedules.filter(s=>s.session!==quiz.session);
   writeJSON("sessions.json",sessions);
   writeJSON("schedule.json",schedules);
 
