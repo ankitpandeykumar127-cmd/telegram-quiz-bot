@@ -1,11 +1,6 @@
 require("dotenv").config();
 const fs = require("fs");
-const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
-
-/* ===================== APP ===================== */
-const app = express();
-app.use(express.json());
 
 /* ===================== ENV ===================== */
 const {
@@ -13,9 +8,7 @@ const {
   ADMIN_IDS,
   QUIZ_GROUP_ID,
   QUIZ_CHANNEL_ID,
-  GROUP_INVITE_LINK,
-  APP_URL,
-  PORT
+  GROUP_INVITE_LINK
 } = process.env;
 
 if (
@@ -23,8 +16,7 @@ if (
   !ADMIN_IDS ||
   !QUIZ_GROUP_ID ||
   !QUIZ_CHANNEL_ID ||
-  !GROUP_INVITE_LINK ||
-  !APP_URL
+  !GROUP_INVITE_LINK
 ) {
   console.error("❌ Missing ENV values");
   process.exit(1);
@@ -34,26 +26,15 @@ const ADMINS = ADMIN_IDS.split(",").map(Number);
 const GROUP_ID = Number(QUIZ_GROUP_ID);
 const CHANNEL_ID = Number(QUIZ_CHANNEL_ID);
 
-/* ===================== BOT (WEBHOOK ONLY) ===================== */
-const bot = new TelegramBot(BOT_TOKEN, { webHook: true });
-
-const WEBHOOK_PATH = `/bot${BOT_TOKEN}`;
-const WEBHOOK_URL = `${APP_URL}${WEBHOOK_PATH}`;
-
-bot.setWebHook(WEBHOOK_URL)
-  .then(() => console.log("✅ Webhook set:", WEBHOOK_URL))
-  .catch(console.error);
-
-app.post(WEBHOOK_PATH, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
+/* ===================== BOT (POLLING MODE) ===================== */
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true
+  }
 });
 
-app.listen(PORT || 8080, () =>
-  console.log("🚀 Webhook server running")
-);
-
-console.log("🤖 Quiz Bot Running (Webhook Mode)");
+console.log("🤖 Quiz Bot Running (POLLING MODE)");
 
 /* ===================== FILE HELPERS ===================== */
 const safeRead = (file, def) => {
@@ -97,7 +78,8 @@ const setGroupPermission = canTalk => {
 
 /* ===================== START ===================== */
 bot.onText(/\/start/, msg => {
-  bot.sendMessage(msg.chat.id,
+  bot.sendMessage(
+    msg.chat.id,
 `👋 Welcome ${msg.from.first_name}
 
 🧠 Quiz → Group
@@ -109,11 +91,11 @@ bot.onText(/\/start/, msg => {
 /* ===================== ADMIN ===================== */
 bot.onText(/\/admin/, msg => {
   if (!isAdmin(msg.from.id)) return;
-  bot.sendMessage(msg.chat.id,
+  bot.sendMessage(
+    msg.chat.id,
 `🛠 Admin Panel
 
 /status
-/deleteschedule SESSION_NAME
 
 📥 Send quiz in ONE message`
   );
@@ -142,20 +124,19 @@ bot.on("message", msg => {
         if (/^[A-D]\)/.test(l)) o.push(l.slice(2).trim());
         if (l.startsWith("ANS:")) a=l.replace("ANS:","").trim();
       });
-      if (q && o.length===4 && a)
+      if (q && o.length===4 && a) {
         sessions[key].push({
           question:q,
           options:o,
           correct:a.charCodeAt(0)-65
         });
+      }
     });
 
     schedules.push({
       session:key,
       date,
       time,
-      notice:false,
-      discussion:false,
       started:false
     });
 
@@ -210,33 +191,9 @@ setInterval(()=>{
     const [h,m]=s.time.split(":").map(Number);
     const t=new Date(s.date);
     t.setHours(h,m,0,0);
-    const diff=t-now;
 
-    if (!s.discussion && diff<=30*60*1000 && diff>0) {
-      s.discussion=true;
-      setGroupPermission(true);
-      bot.sendMessage(GROUP_ID,"💬 Discussion opened");
-    }
-
-    if (!s.notice && diff<=5*60*1000 && diff>0) {
-      s.notice=true;
-      bot.sendMessage(
-        CHANNEL_ID,
-`🚨 *Quiz Alert*
-📘 ${s.session}
-⏳ Starts in 5 minutes`,
-{
-  parse_mode:"Markdown",
-  reply_markup:{
-    inline_keyboard:[
-      [{text:"🚀 Join Quiz Group",url:GROUP_INVITE_LINK}]
-    ]
-  }
-});
-    }
-
-    if (diff<=60*1000 && diff>=-120*1000) {
-      s.started=true;
+    if (now >= t) {
+      s.started = true;
       startQuiz(s.session);
     }
   });
@@ -315,7 +272,6 @@ function showLeaderboard(){
     });
 
   bot.sendMessage(GROUP_ID,t,{parse_mode:"Markdown"});
-  bot.sendMessage(GROUP_ID,"💬 Discussion opened (15 min)");
 
   delete sessions[quiz.session];
   schedules=schedules.filter(s=>s.session!==quiz.session);
@@ -325,7 +281,6 @@ function showLeaderboard(){
 
   setTimeout(()=>{
     setGroupPermission(false);
-    bot.sendMessage(GROUP_ID,"🔒 Discussion closed");
   },15*60*1000);
 }
 
