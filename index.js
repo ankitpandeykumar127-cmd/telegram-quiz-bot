@@ -72,7 +72,6 @@ const setGroupMute = async (isMuted) => {
 
 /* ===================== CORE COMMANDS ===================== */
 
-// /start command with better UI
 bot.onText(/\/start/, (msg) => {
   const welcome = `<b>👋 Welcome ${msg.from.first_name}!</b>\n\n` +
     `🧠 <b>Quiz Mode:</b> Automated\n` +
@@ -81,7 +80,6 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, welcome, { parse_mode: "HTML", disable_web_page_preview: true });
 });
 
-// Admin Panel
 bot.onText(/\/admin/, (msg) => {
   if (!ADMINS.includes(msg.from.id)) return;
   const menu = `<b>${icons.admin} Admin Control Panel</b>\n\n` +
@@ -92,7 +90,7 @@ bot.onText(/\/admin/, (msg) => {
   bot.sendMessage(msg.chat.id, menu, { parse_mode: "HTML" });
 });
 
-/* ===================== QUIZ PARSER (IMPROVED) ===================== */
+/* ===================== QUIZ PARSER (FIXED IST) ===================== */
 bot.on("message", (msg) => {
   if (!ADMINS.includes(msg.from.id) || msg.chat.type !== "private" || !msg.text || msg.text.startsWith("/")) return;
 
@@ -102,11 +100,10 @@ bot.on("message", (msg) => {
   const processBlock = () => {
     if (!dateText || !sessionName || !timeText || !buf.length) return;
 
-    // IST to Date Object conversion logic
     const [d, m, y] = dateText.split("-");
     const startTime = new Date(`${y}-${m}-${d}T${timeText}:00+05:30`).getTime();
 
-    if (isNaN(startTime)) return bot.sendMessage(msg.chat.id, `${icons.error} Invalid Date/Time.`);
+    if (isNaN(startTime)) return bot.sendMessage(msg.chat.id, `${icons.error} Invalid Date/Time format.`);
 
     const key = `${dateText}_${sessionName}`.replace(/\s+/g, "_");
     sessions[key] = [];
@@ -127,18 +124,32 @@ bot.on("message", (msg) => {
     });
 
     if (sessions[key].length > 0) {
-      schedules = schedules.filter(s => s.session !== key); // Remove old same-key
+      schedules = schedules.filter(s => s.session !== key);
       schedules.push({ session: key, startAt: startTime, notified: false, started: false });
-      bot.sendMessage(msg.chat.id, `${icons.success} <b>Quiz Scheduled!</b>\n\n🏷 <b>Key:</b> <code>${key}</code>\n❓ <b>Total:</b> ${sessions[key].length} Questions\n⏰ <b>Time:</b> ${new Date(startTime).toLocaleString('en-IN')}`, { parse_mode: "HTML" });
+
+      const displayTime = new Date(startTime).toLocaleString('en-IN', { 
+        timeZone: 'Asia/Kolkata',
+        dateStyle: 'medium',
+        timeStyle: 'short' 
+      });
+
+      bot.sendMessage(msg.chat.id, 
+        `${icons.success} <b>Quiz Scheduled!</b>\n\n` +
+        `🏷 <b>Key:</b> <code>${key}</code>\n` +
+        `❓ <b>Total:</b> ${sessions[key].length} Questions\n` +
+        `⏰ <b>IST Time:</b> ${displayTime}`, 
+        { parse_mode: "HTML" }
+      );
     }
     buf = [];
   };
 
   lines.forEach(l => {
-    if (l.startsWith("DATE:")) { processBlock(); dateText = l.replace("DATE:", "").trim(); }
-    else if (l.startsWith("SESSION:")) { processBlock(); sessionName = l.replace("SESSION:", "").trim(); }
-    else if (l.startsWith("TIME:")) { timeText = l.replace("TIME:", "").trim(); }
-    else { buf.push(l); }
+    const line = l.trim();
+    if (line.startsWith("DATE:")) { processBlock(); dateText = line.replace("DATE:", "").trim(); }
+    else if (line.startsWith("SESSION:")) { processBlock(); sessionName = line.replace("SESSION:", "").trim(); }
+    else if (line.startsWith("TIME:")) { timeText = line.replace("TIME:", "").trim(); }
+    else { buf.push(line); }
   });
   processBlock();
 
@@ -146,19 +157,29 @@ bot.on("message", (msg) => {
   safeWrite("schedule.json", schedules);
 });
 
-/* ===================== SCHEDULER & ENGINE ===================== */
+/* ===================== SCHEDULER (WITH CHANNEL BUTTON) ===================== */
 setInterval(() => {
   const now = Date.now();
-  schedules.forEach(async (s, index) => {
+  schedules.forEach(async (s) => {
     if (s.started) return;
 
-    // 5 Min Warning
     if (!s.notified && now >= s.startAt - 5 * 60 * 1000) {
       s.notified = true;
-      bot.sendMessage(CHANNEL_ID, `<b>${icons.clock} UPCOMING QUIZ</b>\n\nThe session <u>${s.session}</u> starts in 5 minutes!`, { parse_mode: "HTML" });
+      bot.sendMessage(CHANNEL_ID, 
+        `<b>${icons.clock} UPCOMING QUIZ!</b>\n\n` +
+        `📝 <b>Session:</b> <u>${s.session}</u>\n` +
+        `🚀 Starts in exactly 5 minutes. Get ready!`, 
+        { 
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "🚀 Join Quiz Group", url: GROUP_INVITE_LINK }
+            ]]
+          }
+        }
+      ).catch(e => console.error("Channel Notify Error:", e.message));
     }
 
-    // Auto Start
     if (now >= s.startAt) {
       s.started = true;
       startQuiz(s.session);
@@ -198,11 +219,8 @@ async function sendNext() {
 
     quiz.pollMap[p.poll.id] = { correct: q.correct };
     quiz.index++;
-    
-    // Logic: Wait for poll (30s) + Buffer (5s)
     quiz.timer = setTimeout(sendNext, 35000);
   } catch (e) {
-    console.error("Poll Error:", e.message);
     quiz.index++;
     sendNext();
   }
@@ -243,7 +261,6 @@ async function showLeaderboard() {
 
   await bot.sendMessage(GROUP_ID, board, { parse_mode: "HTML" });
   
-  // Cleanup
   await setGroupMute(false);
   quiz.active = false;
   clearTimeout(quiz.timer);
@@ -254,14 +271,19 @@ async function showLeaderboard() {
   safeWrite("schedule.json", schedules);
 }
 
-/* ===================== ADMIN TOOLS ===================== */
+/* ===================== ADMIN TOOLS (FIXED STATUS IST) ===================== */
 bot.onText(/\/status/, (msg) => {
   if (!ADMINS.includes(msg.from.id)) return;
   let text = `<b>📊 Current System Status</b>\n\n<b>Pending Sessions:</b>\n`;
+  
+  if (schedules.length === 0) text += "No pending sessions.";
+  
   schedules.forEach((s, i) => {
-    text += `${i + 1}. <code>${s.session}</code>\n   📅 ${new Date(s.startAt).toLocaleString('en-IN')}\n`;
+    const time = new Date(s.startAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    text += `${i + 1}. <code>${s.session}</code>\n   📅 ${time}\n`;
   });
-  bot.sendMessage(msg.chat.id, text || "No pending sessions.", { parse_mode: "HTML" });
+  
+  bot.sendMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
 
 bot.onText(/\/stop/, async (msg) => {
@@ -292,5 +314,4 @@ bot.onText(/\/startquiz (.+)/, (msg, match) => {
   }
 });
 
-// Error Handling
 process.on("unhandledRejection", (err) => console.log("Critical Error:", err.message));
