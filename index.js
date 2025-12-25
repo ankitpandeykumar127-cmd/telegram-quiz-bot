@@ -11,13 +11,7 @@ const {
   GROUP_INVITE_LINK
 } = process.env;
 
-if (
-  !BOT_TOKEN ||
-  !ADMIN_IDS ||
-  !QUIZ_GROUP_ID ||
-  !QUIZ_CHANNEL_ID ||
-  !GROUP_INVITE_LINK
-) {
+if (!BOT_TOKEN || !ADMIN_IDS || !QUIZ_GROUP_ID || !QUIZ_CHANNEL_ID || !GROUP_INVITE_LINK) {
   console.error("❌ Missing ENV values");
   process.exit(1);
 }
@@ -26,34 +20,21 @@ const ADMINS = ADMIN_IDS.split(",").map(Number);
 const GROUP_ID = Number(QUIZ_GROUP_ID);
 const CHANNEL_ID = Number(QUIZ_CHANNEL_ID);
 
-/* ===================== BOT (POLLING MODE) ===================== */
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    interval: 300,
-    autoStart: true
-  }
-});
-
-console.log("🤖 Quiz Bot Running (POLLING MODE)");
+/* ===================== BOT ===================== */
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+console.log("🤖 Quiz Bot Running (Polling Mode)");
 
 /* ===================== FILE HELPERS ===================== */
-const safeRead = (file, def) => {
-  try {
-    if (!fs.existsSync(file)) return def;
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return def;
-  }
+const read = (f, d) => {
+  try { return JSON.parse(fs.readFileSync(f)); }
+  catch { return d; }
 };
+const write = (f, d) => fs.writeFileSync(f, JSON.stringify(d, null, 2));
 
-const safeWrite = (file, data) => {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-};
+let sessions = read("sessions.json", {});
+let schedules = read("schedule.json", []);
 
-/* ===================== DATA ===================== */
-let sessions = safeRead("sessions.json", {});
-let schedules = safeRead("schedule.json", []);
-
+/* ===================== QUIZ STATE ===================== */
 let quiz = {
   active: false,
   session: null,
@@ -76,33 +57,29 @@ const setGroupPermission = canTalk => {
   }).catch(() => {});
 };
 
-/* ===================== START ===================== */
-bot.onText(/\/start/, msg => {
-  bot.sendMessage(
-    msg.chat.id,
-`👋 Welcome ${msg.from.first_name}
+const getTimestamp = (date, time) => {
+  const [y,m,d] = date.split("-").map(Number);
+  const [hh,mm] = time.split(":").map(Number);
+  return new Date(y, m-1, d, hh, mm, 0, 0).getTime();
+};
 
-🧠 Quiz → Group
-📢 Notices → Channel
-⚙️ Admin Controlled`
-  );
+/* ===================== BASIC ===================== */
+bot.onText(/\/start/, msg => {
+  bot.sendMessage(msg.chat.id, "👋 Welcome to Quiz Bot");
 });
 
-/* ===================== ADMIN ===================== */
 bot.onText(/\/admin/, msg => {
   if (!isAdmin(msg.from.id)) return;
-  bot.sendMessage(m.chat.id,
+  bot.sendMessage(msg.chat.id,
 `🛠 Admin Commands
 /status
 /stop
-/deleteschedule SESSION_KEY`
-);
+/deleteschedule SESSION_NAME`);
 });
 
 /* ===================== QUIZ PARSER ===================== */
 bot.on("message", msg => {
-  if (!isAdmin(msg.from.id)) return;
-  if (msg.chat.type !== "private") return;
+  if (!isAdmin(msg.from.id) || msg.chat.type !== "private") return;
   if (!msg.text || msg.text.startsWith("/")) return;
 
   const lines = msg.text.split("\n");
@@ -114,15 +91,15 @@ bot.on("message", msg => {
     const key = `${date}_${session}`;
     sessions[key] = [];
 
-    buf.join("\n").split(/\n\s*\n/).forEach(b => {
+    buf.join("\n").split(/\n\s*\n/).forEach(b=>{
       let q="", o=[], a="";
-      b.split("\n").forEach(l => {
+      b.split("\n").forEach(l=>{
         l=l.trim();
-        if (/^Q/.test(l)) q=l.replace(/^Q\d*\.\s*/,"");
-        if (/^[A-D]\)/.test(l)) o.push(l.slice(2).trim());
-        if (l.startsWith("ANS:")) a=l.replace("ANS:","").trim();
+        if(/^Q/.test(l)) q=l.replace(/^Q\d*\.\s*/,"");
+        if(/^[A-D]\)/.test(l)) o.push(l.slice(2).trim());
+        if(l.startsWith("ANS:")) a=l.replace("ANS:","").trim();
       });
-      if (q && o.length===4 && a) {
+      if(q && o.length===4 && a){
         sessions[key].push({
           question:q,
           options:o,
@@ -135,74 +112,58 @@ bot.on("message", msg => {
       session:key,
       date,
       time,
-      started:false
+      discussion:false,
+      notice:false,
+      started:false,
+      ended:false
     });
-
     buf=[];
   };
 
   lines.forEach(l=>{
     l=l.trim();
-    if (l.startsWith("DATE:")) {
-      flush();
-      date=l.replace("DATE:","").trim().split("-").reverse().join("-");
-    }
-    else if (l.startsWith("SESSION:")) {
-      flush();
-      session=l.replace("SESSION:","").trim();
-    }
-    else if (l.startsWith("TIME:")) time=l.replace("TIME:","").trim();
+    if(l.startsWith("DATE:")){ flush(); date=l.replace("DATE:","").trim(); }
+    else if(l.startsWith("SESSION:")){ flush(); session=l.replace("SESSION:","").trim(); }
+    else if(l.startsWith("TIME:")) time=l.replace("TIME:","").trim();
     else buf.push(l);
   });
 
   flush();
-  safeWrite("sessions.json",sessions);
-  safeWrite("schedule.json",schedules);
-
-  bot.sendMessage(msg.chat.id,"✅ Quiz saved successfully");
+  write("sessions.json",sessions);
+  write("schedule.json",schedules);
+  bot.sendMessage(msg.chat.id,"✅ Quiz saved");
 });
 
 /* ===================== STATUS ===================== */
-bot.onText(/\/status/, msg => {
-  if (!isAdmin(msg.from.id)) return;
-
-  let t="📊 *Bot Status*\n\n📘 Sessions:\n";
-  Object.keys(sessions).forEach((k,i)=>{
-    t+=`${i+1}. ${k} (${sessions[k].length}Q)\n`;
+bot.onText(/\/status/, msg=>{
+  if(!isAdmin(msg.from.id)) return;
+  let t="📊 Status\n\n";
+  schedules.forEach(s=>{
+    t+=`${s.session} | ${s.date} ${s.time}\n`;
   });
-
-  t+="\n⏰ Schedules:\n";
-  schedules.forEach((s,i)=>{
-    t+=`${i+1}. ${s.session} — ${s.date} ${s.time}\n`;
-  });
-
-  bot.sendMessage(msg.chat.id,t,{parse_mode:"Markdown"});
+  bot.sendMessage(msg.chat.id,t);
 });
-/* ===================== STOP QUIZ ===================== */
-bot.onText(/\/stop/, msg => {
-  if (!isAdmin(msg.from.id)) return;
-  if (!quiz.active)
-    return bot.sendMessage(msg.chat.id,"⚠️ No active quiz");
 
+/* ===================== DELETE ===================== */
+bot.onText(/\/deleteschedule (.+)/, msg=>{
+  if(!isAdmin(msg.from.id)) return;
+  const name=msg.match[1];
+
+  schedules = schedules.filter(s=>s.session!==name);
+  delete sessions[name];
+
+  write("schedule.json",schedules);
+  write("sessions.json",sessions);
+
+  bot.sendMessage(msg.chat.id,`🗑 Deleted: ${name}`);
+});
+
+/* ===================== STOP ===================== */
+bot.onText(/\/stop/, msg=>{
+  if(!isAdmin(msg.from.id)) return;
   quiz.active=false;
-  quiz.session=null;
   setGroupPermission(true);
-
-  bot.sendMessage(GROUP_ID,"🛑 Quiz stopped by admin");
-});
-
-/* ===================== DELETE SESSION ===================== */
-bot.onText(/\/delete (.+)/, (msg,m)=>{
-  if (!isAdmin(msg.from.id)) return;
-
-  const session=m[1];
-  delete sessions[session];
-  schedules=schedules.filter(s=>s.session!==session);
-
-  safeWrite("sessions.json",sessions);
-  safeWrite("schedule.json",schedules);
-
-  bot.sendMessage(msg.chat.id,`🗑 Deleted: ${session}`);
+  bot.sendMessage(GROUP_ID,"⛔ Quiz stopped by admin");
 });
 
 /* ===================== SCHEDULER ===================== */
@@ -210,34 +171,39 @@ setInterval(()=>{
   const now=Date.now();
 
   schedules.forEach(s=>{
-    if (s.started) return;
+    if(s.ended) return;
 
-    if (!s.notified && now >= s.startAt - 5*60*1000) {
-      s.notified=true;
-      bot.sendMessage(CHANNEL_ID,
-        `⏰ Quiz starts in 5 minutes\nSession: ${s.session}`);
+    const startTS=getTimestamp(s.date,s.time);
+
+    if(!s.discussion && now >= startTS-30*60*1000){
+      s.discussion=true;
+      setGroupPermission(true);
+      bot.sendMessage(GROUP_ID,"💬 Discussion opened");
     }
 
-    if (now >= s.startAt) {
+    if(!s.notice && now >= startTS-5*60*1000){
+      s.notice=true;
+      bot.sendMessage(CHANNEL_ID,
+`🚨 Quiz Alert
+📘 ${s.session}
+⏳ Starts in 5 minutes`,
+{ reply_markup:{ inline_keyboard:[
+  [{text:"🚀 Join Quiz Group",url:GROUP_INVITE_LINK}]
+]}});
+    }
+
+    if(!s.started && now >= startTS){
       s.started=true;
       startQuiz(s.session);
     }
   });
 
-  safeWrite("schedule.json",schedules);
-},5000);
+  write("schedule.json",schedules);
+},10000);
+
 /* ===================== QUIZ ===================== */
 function startQuiz(session){
-  quiz={
-    active:true,
-    session,
-    index:0,
-    pollMap:{},
-    scores:{},
-    users:{},
-    answered:{}
-  };
-
+  quiz={ active:true, session, index:0, pollMap:{}, scores:{}, users:{}, answered:{} };
   setGroupPermission(false);
   bot.sendMessage(GROUP_ID,`🟢 Quiz Started: ${session}`);
   sendNext();
@@ -246,69 +212,38 @@ function startQuiz(session){
 function sendNext(){
   if(!quiz.active) return;
   const q=sessions[quiz.session]?.[quiz.index];
-  if(!q) return setTimeout(showLeaderboard,3000);
+  if(!q) return endQuiz();
 
   const idx=quiz.index;
-
-  bot.sendPoll(
-    GROUP_ID,
-    `Q${idx+1}. ${q.question}`,
-    q.options,
-    {
-      type:"quiz",
-      correct_option_id:q.correct,
-      is_anonymous:false,
-      open_period:20
-    }
-  ).then(p=>{
+  bot.sendPoll(GROUP_ID,`Q${idx+1}. ${q.question}`,q.options,{
+    type:"quiz",correct_option_id:q.correct,is_anonymous:false,open_period:20
+  }).then(p=>{
     quiz.pollMap[p.poll.id]={correct:q.correct,index:idx};
     quiz.index++;
     setTimeout(sendNext,25000);
   });
 }
 
-/* ===================== SCORE ===================== */
 bot.on("poll_answer",a=>{
   if(!quiz.active) return;
-  const map=quiz.pollMap[a.poll_id];
-  if(!map) return;
-
-  const uid=a.user.id;
-  quiz.users[uid]=a.user.first_name||"User";
-  quiz.answered[uid] ??= {};
-
-  if(quiz.answered[uid][map.index]) return;
-  quiz.answered[uid][map.index]=true;
-
-  if(a.option_ids[0]===map.correct)
-    quiz.scores[uid]=(quiz.scores[uid]||0)+1;
+  const m=quiz.pollMap[a.poll_id];
+  if(!m) return;
+  const u=a.user.id;
+  quiz.users[u]=a.user.first_name;
+  quiz.answered[u]??={};
+  if(quiz.answered[u][m.index]) return;
+  quiz.answered[u][m.index]=true;
+  if(a.option_ids[0]===m.correct)
+    quiz.scores[u]=(quiz.scores[u]||0)+1;
 });
 
-function showLeaderboard(){
+function endQuiz(){
   setGroupPermission(true);
-  const total=sessions[quiz.session]?.length||0;
-
-  let t="🏆 *Leaderboard*\n\n";
+  let t="🏆 Leaderboard\n\n";
   Object.keys(quiz.users)
     .map(id=>({n:quiz.users[id],s:quiz.scores[id]||0}))
     .sort((a,b)=>b.s-a.s)
-    .forEach((u,i)=>{
-      t+=`${i+1}. *${u.n}* — ${u.s}/${total}\n`;
-    });
-
-  bot.sendMessage(GROUP_ID,t,{parse_mode:"Markdown"});
-
-  delete sessions[quiz.session];
-  schedules=schedules.filter(s=>s.session!==quiz.session);
-
-  safeWrite("sessions.json",sessions);
-  safeWrite("schedule.json",schedules);
-
-  setTimeout(()=>{
-    setGroupPermission(false);
-  },15*60*1000);
+    .forEach((u,i)=>t+=`${i+1}. ${u.n} — ${u.s}\n`);
+  bot.sendMessage(GROUP_ID,t);
+  quiz.active=false;
 }
-
-/* ===================== SAFETY ===================== */
-process.on("unhandledRejection",console.error);
-process.on("uncaughtException",console.error);
