@@ -2,7 +2,7 @@ require("dotenv").config();
 const fs = require("fs");
 const TelegramBot = require("node-telegram-bot-api");
 
-/* ===================== ENV ===================== */
+/* ===================== CONFIG & ENV ===================== */
 const {
   BOT_TOKEN,
   ADMIN_IDS,
@@ -11,35 +11,34 @@ const {
   GROUP_INVITE_LINK
 } = process.env;
 
-if (!BOT_TOKEN || !ADMIN_IDS || !QUIZ_GROUP_ID || !QUIZ_CHANNEL_ID) {
-  console.error("❌ Missing ENV values");
-  process.exit(1);
-}
-
 const ADMINS = ADMIN_IDS.split(",").map(Number);
 const GROUP_ID = Number(QUIZ_GROUP_ID);
 const CHANNEL_ID = Number(QUIZ_CHANNEL_ID);
 
-/* ===================== BOT ===================== */
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-console.log("🤖 Quiz Bot is Online and Ready!");
 
-/* ===================== FILE HELPERS ===================== */
+// UI Helpers
+const icons = {
+  success: "✅",
+  error: "❌",
+  clock: "⏰",
+  trophy: "🏆",
+  rocket: "🚀",
+  admin: "🛠",
+  stop: "🛑"
+};
+
+/* ===================== DATA PERSISTENCE ===================== */
 const safeRead = (file, def) => {
   try {
-    if (!fs.existsSync(file)) return def;
-    const data = fs.readFileSync(file, "utf8");
-    return data ? JSON.parse(data) : def;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch { return def; }
 };
 
 const safeWrite = (file, data) => {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-  } catch (err) { console.error(`Error writing ${file}:`, err); }
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 };
 
-/* ===================== DATA INITIALIZATION ===================== */
 let sessions = safeRead("sessions.json", {});
 let schedules = safeRead("schedule.json", []);
 
@@ -50,170 +49,116 @@ let quiz = {
   pollMap: {},
   scores: {},
   users: {},
-  answered: {}
+  timer: null
 };
 
-/* ===================== HELPERS ===================== */
-const isAdmin = id => ADMINS.includes(id);
-
-const setGroupPermission = (canTalk) => {
-  bot.setChatPermissions(GROUP_ID, {
-    can_send_messages: canTalk,
-    can_send_audios: canTalk,
-    can_send_documents: canTalk,
-    can_send_photos: canTalk,
-    can_send_videos: canTalk,
-    can_send_video_notes: canTalk,
-    can_send_voice_notes: canTalk,
-    can_send_polls: canTalk,
-    can_send_other_messages: canTalk,
-    can_add_web_page_previews: canTalk
-  }).catch(err => console.error("Permission Error:", err.message));
+/* ===================== PERMISSIONS ===================== */
+const setGroupMute = async (isMuted) => {
+  try {
+    await bot.setChatPermissions(GROUP_ID, {
+      can_send_messages: !isMuted,
+      can_send_audios: !isMuted,
+      can_send_documents: !isMuted,
+      can_send_photos: !isMuted,
+      can_send_videos: !isMuted,
+      can_send_video_notes: !isMuted,
+      can_send_voice_notes: !isMuted,
+      can_send_polls: !isMuted,
+      can_send_other_messages: !isMuted,
+      can_add_web_page_previews: !isMuted
+    });
+  } catch (e) { console.error("Permission Error:", e.message); }
 };
 
-/* ===================== COMMANDS ===================== */
-bot.onText(/\/start/, msg => {
-  bot.sendMessage(msg.chat.id, `👋 Hello ${msg.from.first_name}!\n\nI manage automated quizzes.\n📢 Join: ${GROUP_INVITE_LINK || 'Not Set'}`);
+/* ===================== CORE COMMANDS ===================== */
+
+// /start command with better UI
+bot.onText(/\/start/, (msg) => {
+  const welcome = `<b>👋 Welcome ${msg.from.first_name}!</b>\n\n` +
+    `🧠 <b>Quiz Mode:</b> Automated\n` +
+    `📢 <b>Channel:</b> <a href="${GROUP_INVITE_LINK}">Join Here</a>\n\n` +
+    `<i>Main group is automatically muted during active quizzes.</i>`;
+  bot.sendMessage(msg.chat.id, welcome, { parse_mode: "HTML", disable_web_page_preview: true });
 });
 
-/* ===================== ADMIN COMMAND FIXED ===================== */
-bot.onText(/\/admin/, msg => {
-  if (!isAdmin(msg.from.id)) return;
-  
-  // Markdown ki jagah HTML use karein taaki symbols error na dein
-  const adminText = 
-    `<b>🛠 Admin Commands</b>\n\n` +
-    `/status - Check sessions/schedules\n` +
-    `/stop - Force stop current quiz\n` +
-    `/delete SESSION_KEY - Delete a session`;
-
-  bot.sendMessage(msg.chat.id, adminText, { parse_mode: "HTML" });
+// Admin Panel
+bot.onText(/\/admin/, (msg) => {
+  if (!ADMINS.includes(msg.from.id)) return;
+  const menu = `<b>${icons.admin} Admin Control Panel</b>\n\n` +
+    `<code>/status</code> - View all schedules\n` +
+    `<code>/startquiz KEY</code> - Start immediately\n` +
+    `<code>/delete KEY</code> - Remove session\n` +
+    `<code>/stop</code> - Kill active quiz`;
+  bot.sendMessage(msg.chat.id, menu, { parse_mode: "HTML" });
 });
 
-/* ===================== QUIZ PARSER ===================== */
-bot.on("message", msg => {
-  if (!isAdmin(msg.from.id) || msg.chat.type !== "private" || !msg.text || msg.text.startsWith("/")) return;
+/* ===================== QUIZ PARSER (IMPROVED) ===================== */
+bot.on("message", (msg) => {
+  if (!ADMINS.includes(msg.from.id) || msg.chat.type !== "private" || !msg.text || msg.text.startsWith("/")) return;
 
   const lines = msg.text.split("\n");
-  let dateText = null, sessionName = null, timeText = null, buf = [];
+  let dateText, sessionName, timeText, buf = [];
 
-  const flush = () => {
+  const processBlock = () => {
     if (!dateText || !sessionName || !timeText || !buf.length) return;
 
-    const key = `${dateText}_${sessionName}`.replace(/\s+/g, '_');
-    
-    // Convert Date/Time to Timestamp
+    // IST to Date Object conversion logic
     const [d, m, y] = dateText.split("-");
-    const startTime = new Date(`${y}-${m}-${d}T${timeText}:00`).getTime();
+    const startTime = new Date(`${y}-${m}-${d}T${timeText}:00+05:30`).getTime();
 
-    if (isNaN(startTime)) {
-        bot.sendMessage(msg.chat.id, "❌ Invalid Date or Time format.");
-        return;
-    }
+    if (isNaN(startTime)) return bot.sendMessage(msg.chat.id, `${icons.error} Invalid Date/Time.`);
 
+    const key = `${dateText}_${sessionName}`.replace(/\s+/g, "_");
     sessions[key] = [];
-    const blocks = buf.join("\n").split(/\n\s*\n/);
 
+    const blocks = buf.join("\n").split(/\n\s*\n/);
     blocks.forEach(block => {
       let q = "", o = [], a = "";
       block.split("\n").forEach(l => {
         l = l.trim();
-        if (/^Q/.test(l)) q = l.replace(/^Q\d*\.\s*/, "");
+        if (/^Q/i.test(l)) q = l.replace(/^Q\d*\.\s*/i, "");
         else if (/^[A-D]\)/.test(l)) o.push(l.slice(2).trim());
-        else if (l.toUpperCase().startsWith("ANS:")) a = l.replace(/ANS:/i, "").trim().toUpperCase();
+        else if (/^ANS:/i.test(l)) a = l.replace(/^ANS:/i, "").trim().toUpperCase();
       });
 
       if (q && o.length >= 2 && a) {
-        sessions[key].push({
-          question: q,
-          options: o,
-          correct: a.charCodeAt(0) - 65
-        });
+        sessions[key].push({ question: q, options: o, correct: a.charCodeAt(0) - 65 });
       }
     });
 
     if (sessions[key].length > 0) {
-        schedules.push({
-            session: key,
-            startAt: startTime,
-            notified: false,
-            started: false
-        });
-        bot.sendMessage(msg.chat.id, `✅ Added: ${key}\n❓ Questions: ${sessions[key].length}\n⏰ Time: ${new Date(startTime).toLocaleString()}`);
+      schedules = schedules.filter(s => s.session !== key); // Remove old same-key
+      schedules.push({ session: key, startAt: startTime, notified: false, started: false });
+      bot.sendMessage(msg.chat.id, `${icons.success} <b>Quiz Scheduled!</b>\n\n🏷 <b>Key:</b> <code>${key}</code>\n❓ <b>Total:</b> ${sessions[key].length} Questions\n⏰ <b>Time:</b> ${new Date(startTime).toLocaleString('en-IN')}`, { parse_mode: "HTML" });
     }
     buf = [];
   };
 
   lines.forEach(l => {
-    const line = l.trim();
-    if (line.startsWith("DATE:")) { flush(); dateText = line.replace("DATE:", "").trim(); }
-    else if (line.startsWith("SESSION:")) { flush(); sessionName = line.replace("SESSION:", "").trim(); }
-    else if (line.startsWith("TIME:")) { timeText = line.replace("TIME:", "").trim(); }
-    else { buf.push(line); }
+    if (l.startsWith("DATE:")) { processBlock(); dateText = l.replace("DATE:", "").trim(); }
+    else if (l.startsWith("SESSION:")) { processBlock(); sessionName = l.replace("SESSION:", "").trim(); }
+    else if (l.startsWith("TIME:")) { timeText = l.replace("TIME:", "").trim(); }
+    else { buf.push(l); }
   });
-  flush();
+  processBlock();
 
   safeWrite("sessions.json", sessions);
   safeWrite("schedule.json", schedules);
 });
 
-/* ===================== STATUS ===================== */
-bot.onText(/\/status/, msg => {
-  if (!isAdmin(msg.from.id)) return;
-  let text = "📊 *Bot Status*\n\n📘 *Sessions:*";
-  Object.keys(sessions).forEach((k, i) => { text += `\n${i + 1}. ${k} (${sessions[k].length}Q)`; });
-  
-  text += "\n\n⏰ *Schedules:*";
-  schedules.forEach((s, i) => {
-    text += `\n${i + 1}. ${s.session} - ${new Date(s.startAt).toLocaleString()} ${s.started ? '✅' : '⏳'}`;
-  });
-  bot.sendMessage(msg.chat.id, text || "No data found.", { parse_mode: "Markdown" });
-});
-
-// Isse aap kabhi bhi koi bhi saved session turant start kar sakte hain
-bot.onText(/\/startquiz (.+)/, (msg, match) => {
-  if (!isAdmin(msg.from.id)) return;
-  const key = match[1].trim();
-  if (sessions[key]) {
-    startQuiz(key);
-    bot.sendMessage(msg.chat.id, `🚀 Starting Quiz: ${key}`);
-  } else {
-    bot.sendMessage(msg.chat.id, "❌ Session not found! Check /status");
-  }
-});
-
-/* ===================== STOP QUIZ ===================== */
-bot.onText(/\/stop/, msg => {
-  if (!isAdmin(msg.from.id)) return;
-  quiz.active = false;
-  setGroupPermission(true);
-  bot.sendMessage(GROUP_ID, "🛑 Quiz has been stopped by Admin.");
-});
-
-/* ===================== DELETE ===================== */
-bot.onText(/\/delete (.+)/, (msg, match) => {
-  if (!isAdmin(msg.from.id)) return;
-  const key = match[1].trim();
-  delete sessions[key];
-  schedules = schedules.filter(s => s.session !== key);
-  safeWrite("sessions.json", sessions);
-  safeWrite("schedule.json", schedules);
-  bot.sendMessage(msg.chat.id, `🗑 Deleted session: ${key}`);
-});
-
-/* ===================== SCHEDULER ===================== */
+/* ===================== SCHEDULER & ENGINE ===================== */
 setInterval(() => {
   const now = Date.now();
-  schedules.forEach(s => {
+  schedules.forEach(async (s, index) => {
     if (s.started) return;
 
-    // 5 Minute Notification
+    // 5 Min Warning
     if (!s.notified && now >= s.startAt - 5 * 60 * 1000) {
       s.notified = true;
-      bot.sendMessage(CHANNEL_ID, `🔔 *Upcoming Quiz!* \n\nSession: ${s.session}\nStarts in 5 minutes!`, { parse_mode: "Markdown" });
+      bot.sendMessage(CHANNEL_ID, `<b>${icons.clock} UPCOMING QUIZ</b>\n\nThe session <u>${s.session}</u> starts in 5 minutes!`, { parse_mode: "HTML" });
     }
 
-    // Start Quiz
+    // Auto Start
     if (now >= s.startAt) {
       s.started = true;
       startQuiz(s.session);
@@ -221,85 +166,131 @@ setInterval(() => {
   });
 }, 10000);
 
-/* ===================== QUIZ ENGINE ===================== */
-function startQuiz(sessionKey) {
-  if (!sessions[sessionKey]) return;
-  
-  quiz = {
-    active: true,
-    session: sessionKey,
-    index: 0,
-    pollMap: {},
-    scores: {},
-    users: {},
-    answered: {}
-  };
+async function startQuiz(key) {
+  if (quiz.active) return;
+  const qs = sessions[key];
+  if (!qs) return;
 
-  setGroupPermission(false);
-  bot.sendMessage(GROUP_ID, `🚀 *QUIZ STARTED!* \nTopic: ${sessionKey}\nGet ready!`, { parse_mode: "Markdown" });
-  setTimeout(sendNext, 5000);
+  quiz = { active: true, session: key, index: 0, pollMap: {}, scores: {}, users: {} };
+  
+  await setGroupMute(true);
+  await bot.sendMessage(GROUP_ID, `<b>${icons.rocket} QUIZ STARTED!</b>\n\nTopic: <code>${key}</code>\nQuestions: ${qs.length}\n\n<i>Group is now muted. Good luck!</i>`, { parse_mode: "HTML" });
+  
+  setTimeout(sendNext, 3000);
 }
 
-function sendNext() {
+async function sendNext() {
   if (!quiz.active) return;
+  const currentQs = sessions[quiz.session];
 
-  const currentQuestions = sessions[quiz.session];
-  if (!currentQuestions || quiz.index >= currentQuestions.length) {
-    return setTimeout(showLeaderboard, 2000);
+  if (quiz.index >= currentQs.length) {
+    return showLeaderboard();
   }
 
-  const q = currentQuestions[quiz.index];
-  bot.sendPoll(GROUP_ID, `Q${quiz.index + 1}: ${q.question}`, q.options, {
-    type: "quiz",
-    correct_option_id: q.correct,
-    is_anonymous: false,
-    open_period: 25 // 25 seconds to answer
-  }).then(p => {
-    quiz.pollMap[p.poll.id] = { correct: q.correct, index: quiz.index };
+  const q = currentQs[quiz.index];
+  try {
+    const p = await bot.sendPoll(GROUP_ID, `[Q${quiz.index + 1}/${currentQs.length}] ${q.question}`, q.options, {
+      type: "quiz",
+      correct_option_id: q.correct,
+      is_anonymous: false,
+      open_period: 30
+    });
+
+    quiz.pollMap[p.poll.id] = { correct: q.correct };
     quiz.index++;
-    // Wait for poll to close + small buffer before next question
-    setTimeout(sendNext, 30000); 
-  }).catch(console.error);
+    
+    // Logic: Wait for poll (30s) + Buffer (5s)
+    quiz.timer = setTimeout(sendNext, 35000);
+  } catch (e) {
+    console.error("Poll Error:", e.message);
+    quiz.index++;
+    sendNext();
+  }
 }
 
-/* ===================== RESULTS ===================== */
-bot.on("poll_answer", a => {
+/* ===================== SCORING & RESULTS ===================== */
+bot.on("poll_answer", (ans) => {
   if (!quiz.active) return;
-  const data = quiz.pollMap[a.poll_id];
+  const data = quiz.pollMap[ans.poll_id];
   if (!data) return;
 
-  const uid = a.user.id;
-  quiz.users[uid] = a.user.first_name;
-  
-  if (a.option_ids[0] === data.correct) {
+  const uid = ans.user.id;
+  quiz.users[uid] = ans.user.first_name || "Anonymous";
+
+  if (ans.option_ids[0] === data.correct) {
     quiz.scores[uid] = (quiz.scores[uid] || 0) + 1;
   }
 });
 
-function showLeaderboard() {
-  quiz.active = false;
-  setGroupPermission(true);
+async function showLeaderboard() {
+  const sessionKey = quiz.session;
+  const total = sessions[sessionKey]?.length || 0;
+  
+  let board = `<b>${icons.trophy} QUIZ COMPLETED!</b>\n\nSession: <code>${sessionKey}</code>\n\n`;
+  
+  const sorted = Object.entries(quiz.scores)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 10);
 
-  const total = sessions[quiz.session]?.length || 0;
-  let board = `🏆 *QUIZ RESULTS: ${quiz.session}*\n\n`;
+  if (sorted.length === 0) {
+    board += "<i>No participants scored points.</i>";
+  } else {
+    sorted.forEach(([id, score], i) => {
+      const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : "🔹";
+      board += `${medal} <b>${quiz.users[id]}</b>: ${score}/${total}\n`;
+    });
+  }
 
-  const sorted = Object.keys(quiz.users)
-    .map(id => ({ name: quiz.users[id], score: quiz.scores[id] || 0 }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10); // Top 10
-
-  if (sorted.length === 0) board += "No participants.";
-  else sorted.forEach((u, i) => { board += `${i + 1}. ${u.name} — ${u.score}/${total}\n`; });
-
-  bot.sendMessage(GROUP_ID, board, { parse_mode: "Markdown" });
-
+  await bot.sendMessage(GROUP_ID, board, { parse_mode: "HTML" });
+  
   // Cleanup
-  delete sessions[quiz.session];
-  schedules = schedules.filter(s => s.session !== quiz.session);
+  await setGroupMute(false);
+  quiz.active = false;
+  clearTimeout(quiz.timer);
+  
+  delete sessions[sessionKey];
+  schedules = schedules.filter(s => s.session !== sessionKey);
   safeWrite("sessions.json", sessions);
   safeWrite("schedule.json", schedules);
 }
 
-/* ===================== ERROR HANDLING ===================== */
-process.on("unhandledRejection", (re) => console.error("Rejection:", re));
-process.on("uncaughtException", (ex) => console.error("Exception:", ex));
+/* ===================== ADMIN TOOLS ===================== */
+bot.onText(/\/status/, (msg) => {
+  if (!ADMINS.includes(msg.from.id)) return;
+  let text = `<b>📊 Current System Status</b>\n\n<b>Pending Sessions:</b>\n`;
+  schedules.forEach((s, i) => {
+    text += `${i + 1}. <code>${s.session}</code>\n   📅 ${new Date(s.startAt).toLocaleString('en-IN')}\n`;
+  });
+  bot.sendMessage(msg.chat.id, text || "No pending sessions.", { parse_mode: "HTML" });
+});
+
+bot.onText(/\/stop/, async (msg) => {
+  if (!ADMINS.includes(msg.from.id)) return;
+  quiz.active = false;
+  clearTimeout(quiz.timer);
+  await setGroupMute(false);
+  bot.sendMessage(GROUP_ID, `${icons.stop} <b>The quiz has been terminated by Admin.</b>`, { parse_mode: "HTML" });
+});
+
+bot.onText(/\/delete (.+)/, (msg, match) => {
+  if (!ADMINS.includes(msg.from.id)) return;
+  const key = match[1].trim();
+  delete sessions[key];
+  schedules = schedules.filter(s => s.session !== key);
+  safeWrite("sessions.json", sessions);
+  safeWrite("schedule.json", schedules);
+  bot.sendMessage(msg.chat.id, `${icons.success} Session <code>${key}</code> deleted.`, { parse_mode: "HTML" });
+});
+
+bot.onText(/\/startquiz (.+)/, (msg, match) => {
+  if (!ADMINS.includes(msg.from.id)) return;
+  const key = match[1].trim();
+  if (sessions[key]) {
+    startQuiz(key);
+  } else {
+    bot.sendMessage(msg.chat.id, `${icons.error} Session key not found.`);
+  }
+});
+
+// Error Handling
+process.on("unhandledRejection", (err) => console.log("Critical Error:", err.message));
