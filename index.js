@@ -76,15 +76,18 @@ bot.onText(/\/start/, msg => {
   bot.sendMessage(msg.chat.id, `👋 Hello ${msg.from.first_name}!\n\nI manage automated quizzes.\n📢 Join: ${GROUP_INVITE_LINK || 'Not Set'}`);
 });
 
+/* ===================== ADMIN COMMAND FIXED ===================== */
 bot.onText(/\/admin/, msg => {
   if (!isAdmin(msg.from.id)) return;
-  bot.sendMessage(msg.chat.id, 
-    "🛠 *Admin Commands*\n\n" +
-    "/status - Check sessions/schedules\n" +
-    "/stop - Force stop current quiz\n" +
-    "/delete SESSION_KEY - Delete a session", 
-    { parse_mode: "Markdown" }
-  );
+  
+  // Markdown ki jagah HTML use karein taaki symbols error na dein
+  const adminText = 
+    `<b>🛠 Admin Commands</b>\n\n` +
+    `/status - Check sessions/schedules\n` +
+    `/stop - Force stop current quiz\n` +
+    `/delete SESSION_KEY - Delete a session`;
+
+  bot.sendMessage(msg.chat.id, adminText, { parse_mode: "HTML" });
 });
 
 /* ===================== QUIZ PARSER ===================== */
