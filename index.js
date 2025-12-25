@@ -11,7 +11,13 @@ const {
   GROUP_INVITE_LINK
 } = process.env;
 
-if (!BOT_TOKEN || !ADMIN_IDS || !QUIZ_GROUP_ID || !QUIZ_CHANNEL_ID) {
+if (
+  !BOT_TOKEN ||
+  !ADMIN_IDS ||
+  !QUIZ_GROUP_ID ||
+  !QUIZ_CHANNEL_ID ||
+  !GROUP_INVITE_LINK
+) {
   console.error("❌ Missing ENV values");
   process.exit(1);
 }
@@ -20,8 +26,14 @@ const ADMINS = ADMIN_IDS.split(",").map(Number);
 const GROUP_ID = Number(QUIZ_GROUP_ID);
 const CHANNEL_ID = Number(QUIZ_CHANNEL_ID);
 
-/* ===================== BOT (POLLING ONLY) ===================== */
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+/* ===================== BOT (POLLING MODE) ===================== */
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true
+  }
+});
+
 console.log("🤖 Quiz Bot Running (POLLING MODE)");
 
 /* ===================== FILE HELPERS ===================== */
@@ -55,10 +67,6 @@ let quiz = {
 /* ===================== HELPERS ===================== */
 const isAdmin = id => ADMINS.includes(id);
 
-const toTimestamp = (date, time) => {
-  return new Date(`${date}T${time}:00`).getTime();
-};
-
 const setGroupPermission = canTalk => {
   bot.setChatPermissions(GROUP_ID, {
     can_send_messages: canTalk,
@@ -68,7 +76,7 @@ const setGroupPermission = canTalk => {
   }).catch(() => {});
 };
 
-/* ===================== BASIC ===================== */
+/* ===================== START ===================== */
 bot.onText(/\/start/, msg => {
   bot.sendMessage(
     msg.chat.id,
@@ -80,22 +88,20 @@ bot.onText(/\/start/, msg => {
   );
 });
 
-/* ===================== ADMIN PANEL ===================== */
+/* ===================== ADMIN ===================== */
 bot.onText(/\/admin/, msg => {
   if (!isAdmin(msg.from.id)) return;
   bot.sendMessage(
     msg.chat.id,
-`🛠 Admin Commands
+`🛠 Admin Panel
 
 /status
-/stop
-/delete SESSION_NAME
 
 📥 Send quiz in ONE message`
   );
 });
 
-/* ===================== QUIZ INPUT PARSER ===================== */
+/* ===================== QUIZ PARSER ===================== */
 bot.on("message", msg => {
   if (!isAdmin(msg.from.id)) return;
   if (msg.chat.type !== "private") return;
@@ -108,10 +114,6 @@ bot.on("message", msg => {
     if (!date || !session || !time || !buf.length) return;
 
     const key = `${date}_${session}`;
-    const startAt = toTimestamp(date, time);
-
-    if (isNaN(startAt)) return;
-
     sessions[key] = [];
 
     buf.join("\n").split(/\n\s*\n/).forEach(b => {
@@ -133,8 +135,8 @@ bot.on("message", msg => {
 
     schedules.push({
       session:key,
-      startAt,
-      notified:false,
+      date,
+      time,
       started:false
     });
 
@@ -145,24 +147,21 @@ bot.on("message", msg => {
     l=l.trim();
     if (l.startsWith("DATE:")) {
       flush();
-      date=l.replace("DATE:","").trim(); // YYYY-MM-DD
+      date=l.replace("DATE:","").trim().split("-").reverse().join("-");
     }
     else if (l.startsWith("SESSION:")) {
       flush();
       session=l.replace("SESSION:","").trim();
     }
-    else if (l.startsWith("TIME:")) {
-      time=l.replace("TIME:","").trim(); // HH:mm
-    }
+    else if (l.startsWith("TIME:")) time=l.replace("TIME:","").trim();
     else buf.push(l);
   });
 
   flush();
-
   safeWrite("sessions.json",sessions);
   safeWrite("schedule.json",schedules);
 
-  bot.sendMessage(msg.chat.id,"✅ Quiz scheduled successfully");
+  bot.sendMessage(msg.chat.id,"✅ Quiz saved successfully");
 });
 
 /* ===================== STATUS ===================== */
@@ -176,12 +175,11 @@ bot.onText(/\/status/, msg => {
 
   t+="\n⏰ Schedules:\n";
   schedules.forEach((s,i)=>{
-    t+=`${i+1}. ${s.session} — ${new Date(s.startAt).toLocaleString()}\n`;
+    t+=`${i+1}. ${s.session} — ${s.date} ${s.time}\n`;
   });
 
   bot.sendMessage(msg.chat.id,t,{parse_mode:"Markdown"});
 });
-
 /* ===================== STOP QUIZ ===================== */
 bot.onText(/\/stop/, msg => {
   if (!isAdmin(msg.from.id)) return;
@@ -230,12 +228,8 @@ setInterval(()=>{
 
   safeWrite("schedule.json",schedules);
 },5000);
-
-/* ===================== QUIZ ENGINE ===================== */
+/* ===================== QUIZ ===================== */
 function startQuiz(session){
-  if (quiz.active) return;
-  if (!sessions[session]) return;
-
   quiz={
     active:true,
     session,
@@ -253,9 +247,8 @@ function startQuiz(session){
 
 function sendNext(){
   if(!quiz.active) return;
-
-  const q=sessions[quiz.session][quiz.index];
-  if(!q) return finishQuiz();
+  const q=sessions[quiz.session]?.[quiz.index];
+  if(!q) return setTimeout(showLeaderboard,3000);
 
   const idx=quiz.index;
 
@@ -293,14 +286,11 @@ bot.on("poll_answer",a=>{
     quiz.scores[uid]=(quiz.scores[uid]||0)+1;
 });
 
-/* ===================== FINISH ===================== */
-function finishQuiz(){
-  quiz.active=false;
+function showLeaderboard(){
   setGroupPermission(true);
+  const total=sessions[quiz.session]?.length||0;
 
-  const total=sessions[quiz.session].length;
   let t="🏆 *Leaderboard*\n\n";
-
   Object.keys(quiz.users)
     .map(id=>({n:quiz.users[id],s:quiz.scores[id]||0}))
     .sort((a,b)=>b.s-a.s)
@@ -309,6 +299,16 @@ function finishQuiz(){
     });
 
   bot.sendMessage(GROUP_ID,t,{parse_mode:"Markdown"});
+
+  delete sessions[quiz.session];
+  schedules=schedules.filter(s=>s.session!==quiz.session);
+
+  safeWrite("sessions.json",sessions);
+  safeWrite("schedule.json",schedules);
+
+  setTimeout(()=>{
+    setGroupPermission(false);
+  },15*60*1000);
 }
 
 /* ===================== SAFETY ===================== */
