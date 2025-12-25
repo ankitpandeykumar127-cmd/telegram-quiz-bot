@@ -91,14 +91,12 @@ bot.onText(/\/start/, msg => {
 /* ===================== ADMIN ===================== */
 bot.onText(/\/admin/, msg => {
   if (!isAdmin(msg.from.id)) return;
-  bot.sendMessage(
-    msg.chat.id,
-`🛠 Admin Panel
-
+  bot.sendMessage(m.chat.id,
+`🛠 Admin Commands
 /status
-
-📥 Send quiz in ONE message`
-  );
+/stop
+/deleteschedule SESSION_KEY`
+);
 });
 
 /* ===================== QUIZ PARSER ===================== */
