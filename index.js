@@ -170,6 +170,18 @@ bot.onText(/\/status/, msg => {
   bot.sendMessage(msg.chat.id, text || "No data found.", { parse_mode: "Markdown" });
 });
 
+// Isse aap kabhi bhi koi bhi saved session turant start kar sakte hain
+bot.onText(/\/startquiz (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  const key = match[1].trim();
+  if (sessions[key]) {
+    startQuiz(key);
+    bot.sendMessage(msg.chat.id, `🚀 Starting Quiz: ${key}`);
+  } else {
+    bot.sendMessage(msg.chat.id, "❌ Session not found! Check /status");
+  }
+});
+
 /* ===================== STOP QUIZ ===================== */
 bot.onText(/\/stop/, msg => {
   if (!isAdmin(msg.from.id)) return;
